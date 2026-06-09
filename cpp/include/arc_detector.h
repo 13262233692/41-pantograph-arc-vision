@@ -5,6 +5,8 @@
 #include <memory>
 #include <cstdint>
 #include <string>
+#include <mutex>
+#include <unordered_map>
 #include "trt_engine.h"
 #include "cuda_preprocess.h"
 
@@ -33,6 +35,14 @@ struct ArcDetectorConfig {
     int roi_padding = 20;
     int model_input_h = 640;
     int model_input_w = 640;
+    int context_pool_size = 4;
+};
+
+struct StreamInferContext {
+    std::unique_ptr<TRTEngine> visible_engine;
+    std::unique_ptr<TRTEngine> uv_engine;
+    int stream_index;
+    bool initialized = false;
 };
 
 class ArcDetector {
@@ -43,6 +53,9 @@ public:
     bool init();
     void shutdown();
 
+    bool init_stream(int stream_index);
+    void shutdown_stream(int stream_index);
+
     std::vector<ArcFlashEvent> detect(
         const unsigned char* visible_gpu,
         const unsigned char* uv_gpu,
@@ -52,12 +65,16 @@ public:
         cudaStream_t stream = nullptr);
 
 private:
+    StreamInferContext* get_stream_context(int stream_index);
+
     std::vector<PantographROI> extract_pantograph_rois(
+        TRTEngine* vis_engine,
         const unsigned char* visible_gpu,
         int width, int height,
         cudaStream_t stream);
 
     std::vector<ArcFlashEvent> detect_arc_in_rois(
+        TRTEngine* uv_engine,
         const unsigned char* uv_gpu,
         const unsigned char* visible_gpu,
         int width, int height,
@@ -71,9 +88,9 @@ private:
         float nms_thresh);
 
     ArcDetectorConfig config_;
-    std::unique_ptr<TRTEngine> visible_engine_;
-    std::unique_ptr<TRTEngine> uv_engine_;
-    bool initialized_ = false;
+    std::mutex contexts_mutex_;
+    std::unordered_map<int, std::unique_ptr<StreamInferContext>> stream_contexts_;
+    bool base_initialized_ = false;
 };
 
 #endif

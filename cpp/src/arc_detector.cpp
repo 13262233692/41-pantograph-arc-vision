@@ -5,17 +5,33 @@
 #include <cuda_runtime.h>
 
 ArcDetector::ArcDetector(const ArcDetectorConfig& config)
-    : config_(config),
-      visible_engine_(std::make_unique<TRTEngine>()),
-      uv_engine_(std::make_unique<TRTEngine>()) {}
+    : config_(config) {}
 
 ArcDetector::~ArcDetector() {
     shutdown();
 }
 
 bool ArcDetector::init() {
-    if (initialized_) return true;
+    if (base_initialized_) return true;
+    cudaSetDevice(config_.tensorrt_device);
+    base_initialized_ = true;
+    fprintf(stderr, "[ArcDetector] Base initialized (device=%d, context_pool=%d)\n",
+            config_.tensorrt_device, config_.context_pool_size);
+    return true;
+}
 
+bool ArcDetector::init_stream(int stream_index) {
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+
+    auto it = stream_contexts_.find(stream_index);
+    if (it != stream_contexts_.end() && it->second->initialized) {
+        return true;
+    }
+
+    auto ctx = std::make_unique<StreamInferContext>();
+    ctx->stream_index = stream_index;
+
+    ctx->visible_engine = std::make_unique<TRTEngine>();
     InferConfig vis_config;
     vis_config.engine_path = config_.visible_engine_path;
     vis_config.device_id = config_.tensorrt_device;
@@ -24,12 +40,14 @@ bool ArcDetector::init() {
     vis_config.input_h = config_.model_input_h;
     vis_config.input_w = config_.model_input_w;
     vis_config.fp16 = true;
+    vis_config.context_pool_size = 1;
 
-    if (!visible_engine_->load(vis_config)) {
-        fprintf(stderr, "[ArcDetector] Failed to load visible light engine\n");
+    if (!ctx->visible_engine->load(vis_config)) {
+        fprintf(stderr, "[ArcDetector] stream=%d: Failed to load visible engine\n", stream_index);
         return false;
     }
 
+    ctx->uv_engine = std::make_unique<TRTEngine>();
     InferConfig uv_config;
     uv_config.engine_path = config_.uv_engine_path;
     uv_config.device_id = config_.tensorrt_device;
@@ -38,22 +56,52 @@ bool ArcDetector::init() {
     uv_config.input_h = config_.model_input_h;
     uv_config.input_w = config_.model_input_w;
     uv_config.fp16 = true;
+    uv_config.context_pool_size = 1;
 
-    if (!uv_engine_->load(uv_config)) {
-        fprintf(stderr, "[ArcDetector] Failed to load UV engine\n");
+    if (!ctx->uv_engine->load(uv_config)) {
+        fprintf(stderr, "[ArcDetector] stream=%d: Failed to load UV engine\n", stream_index);
         return false;
     }
 
-    initialized_ = true;
-    fprintf(stderr, "[ArcDetector] Initialized successfully\n");
+    ctx->initialized = true;
+    stream_contexts_[stream_index] = std::move(ctx);
+
+    fprintf(stderr, "[ArcDetector] stream=%d: Created exclusive inference context "
+            "(vis_ctx=%d, uv_ctx=%d)\n",
+            stream_index,
+            ctx->visible_engine->pool_size(),
+            ctx->uv_engine->pool_size());
     return true;
 }
 
+void ArcDetector::shutdown_stream(int stream_index) {
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+    auto it = stream_contexts_.find(stream_index);
+    if (it != stream_contexts_.end()) {
+        it->second->visible_engine->unload();
+        it->second->uv_engine->unload();
+        stream_contexts_.erase(it);
+        fprintf(stderr, "[ArcDetector] stream=%d: Shutdown inference context\n", stream_index);
+    }
+}
+
 void ArcDetector::shutdown() {
-    if (!initialized_) return;
-    visible_engine_->unload();
-    uv_engine_->unload();
-    initialized_ = false;
+    std::lock_guard<std::mutex> lock(contexts_mutex_);
+    for (auto& [idx, ctx] : stream_contexts_) {
+        ctx->visible_engine->unload();
+        ctx->uv_engine->unload();
+    }
+    stream_contexts_.clear();
+    base_initialized_ = false;
+    fprintf(stderr, "[ArcDetector] All streams shutdown\n");
+}
+
+StreamInferContext* ArcDetector::get_stream_context(int stream_index) {
+    auto it = stream_contexts_.find(stream_index);
+    if (it == stream_contexts_.end() || !it->second->initialized) {
+        return nullptr;
+    }
+    return it->second.get();
 }
 
 std::vector<ArcFlashEvent> ArcDetector::detect(
@@ -63,24 +111,34 @@ std::vector<ArcFlashEvent> ArcDetector::detect(
     int64_t pts_ns,
     int32_t stream_index,
     cudaStream_t stream) {
-    if (!initialized_) return {};
+    if (!base_initialized_) return {};
 
-    auto rois = extract_pantograph_rois(visible_gpu, width, height, stream);
+    StreamInferContext* sctx = get_stream_context(stream_index);
+    if (!sctx) {
+        fprintf(stderr, "[ArcDetector] stream=%d: No inference context, skipping frame\n",
+                stream_index);
+        return {};
+    }
+
+    auto rois = extract_pantograph_rois(sctx->visible_engine.get(),
+                                         visible_gpu, width, height, stream);
     if (rois.empty()) {
         return {};
     }
 
-    auto events = detect_arc_in_rois(uv_gpu, visible_gpu, width, height,
+    auto events = detect_arc_in_rois(sctx->uv_engine.get(),
+                                     uv_gpu, visible_gpu, width, height,
                                      rois, pts_ns, stream_index, stream);
 
     return nms(events, config_.nms_thresh);
 }
 
 std::vector<PantographROI> ArcDetector::extract_pantograph_rois(
+    TRTEngine* vis_engine,
     const unsigned char* visible_gpu,
     int width, int height,
     cudaStream_t stream) {
-    auto detections = visible_engine_->infer(visible_gpu, width, height, 3, stream);
+    auto detections = vis_engine->infer(visible_gpu, width, height, 3, stream);
 
     std::vector<PantographROI> rois;
     for (const auto& det : detections) {
@@ -104,6 +162,7 @@ std::vector<PantographROI> ArcDetector::extract_pantograph_rois(
 }
 
 std::vector<ArcFlashEvent> ArcDetector::detect_arc_in_rois(
+    TRTEngine* uv_engine,
     const unsigned char* uv_gpu,
     const unsigned char* visible_gpu,
     int width, int height,
@@ -146,7 +205,7 @@ std::vector<ArcFlashEvent> ArcDetector::detect_arc_in_rois(
             dst_w, dst_h,
             mean, std_dev, false, stream);
 
-        auto detections = uv_engine_->infer(
+        auto detections = uv_engine->infer(
             static_cast<const unsigned char*>(roi_input_gpu),
             dst_w, dst_h, 3, stream);
 

@@ -1,15 +1,69 @@
 #include "trt_engine.h"
+#include "cuda_preprocess.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <algorithm>
+#include <chrono>
 #include <cuda_runtime.h>
 
 void Logger::log(Severity severity, const char* msg) noexcept {
     if (severity <= Severity::kWARNING) {
         fprintf(stderr, "[TRT] %s\n", msg);
     }
+}
+
+bool ExecutionContext::allocate(const InferConfig& config,
+                                nvinfer1::ICudaEngine* engine,
+                                int input_index,
+                                const std::vector<int>& out_indices,
+                                const std::vector<size_t>& out_sizes,
+                                size_t in_size) {
+    if (input_index >= 0) {
+        if (cudaMalloc(&input_device, in_size) != cudaSuccess) {
+            fprintf(stderr, "[TRT] ctx=%d: Failed to allocate input device buffer\n", slot_id);
+            return false;
+        }
+        input_host = static_cast<float*>(malloc(in_size));
+        if (!input_host) return false;
+    }
+
+    for (size_t i = 0; i < out_indices.size(); ++i) {
+        void* dev_ptr = nullptr;
+        if (cudaMalloc(&dev_ptr, out_sizes[i]) != cudaSuccess) {
+            fprintf(stderr, "[TRT] ctx=%d: Failed to allocate output device buffer %zu\n", slot_id, i);
+            return false;
+        }
+        output_device_ptrs.push_back(dev_ptr);
+
+        float* host_ptr = static_cast<float*>(malloc(out_sizes[i]));
+        if (!host_ptr) return false;
+        output_hosts.push_back(host_ptr);
+    }
+
+    if (cudaStreamCreateWithFlags(&own_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        fprintf(stderr, "[TRT] ctx=%d: Failed to create CUDA stream\n", slot_id);
+        return false;
+    }
+
+    fprintf(stderr, "[TRT] ctx=%d: Allocated exclusive buffers (input=%zu bytes, outputs=%zu)\n",
+            slot_id, in_size, out_sizes.size());
+    return true;
+}
+
+void ExecutionContext::free() {
+    if (input_device) { cudaFree(input_device); input_device = nullptr; }
+    if (input_host) { ::free(input_host); input_host = nullptr; }
+
+    for (auto* p : output_device_ptrs) { if (p) cudaFree(p); }
+    output_device_ptrs.clear();
+
+    for (auto* p : output_hosts) { if (p) ::free(p); }
+    output_hosts.clear();
+
+    if (own_stream) { cudaStreamDestroy(own_stream); own_stream = nullptr; }
+    if (trt_ctx) { trt_ctx->destroy(); trt_ctx = nullptr; }
 }
 
 TRTEngine::TRTEngine() = default;
@@ -45,12 +99,6 @@ bool TRTEngine::load(const InferConfig& config) {
         return false;
     }
 
-    context_ = engine_->createExecutionContext();
-    if (!context_) {
-        fprintf(stderr, "[TRT] Failed to create execution context\n");
-        return false;
-    }
-
     const int nb = engine_->getNbBindings();
     for (int i = 0; i < nb; ++i) {
         nvinfer1::Dims dims = engine_->getBindingDimensions(i);
@@ -68,52 +116,84 @@ bool TRTEngine::load(const InferConfig& config) {
         }
     }
 
-    return allocate_buffers();
-}
-
-void TRTEngine::unload() {
-    free_buffers();
-
-    if (context_) { context_->destroy(); context_ = nullptr; }
-    if (engine_) { engine_->destroy(); engine_ = nullptr; }
-    if (runtime_) { runtime_->destroy(); runtime_ = nullptr; }
-}
-
-bool TRTEngine::allocate_buffers() {
-    if (input_index_ >= 0) {
-        if (cudaMalloc(&input_device_, input_size_) != cudaSuccess) {
-            fprintf(stderr, "[TRT] Failed to allocate input buffer\n");
-            return false;
-        }
-        input_host_ = static_cast<float*>(malloc(input_size_));
-        if (!input_host_) return false;
+    if (!create_context_pool()) {
+        fprintf(stderr, "[TRT] Failed to create context pool\n");
+        return false;
     }
 
-    for (size_t i = 0; i < output_indices_.size(); ++i) {
-        void* dev_ptr = nullptr;
-        if (cudaMalloc(&dev_ptr, output_sizes_[i]) != cudaSuccess) {
-            fprintf(stderr, "[TRT] Failed to allocate output buffer %zu\n", i);
+    fprintf(stderr, "[TRT] Engine loaded with %d exclusive execution contexts\n",
+            static_cast<int>(contexts_.size()));
+    return true;
+}
+
+bool TRTEngine::create_context_pool() {
+    int pool_sz = config_.context_pool_size;
+    if (pool_sz <= 0) pool_sz = 1;
+
+    for (int i = 0; i < pool_sz; ++i) {
+        auto ctx = std::make_unique<ExecutionContext>();
+        ctx->slot_id = i;
+
+        ctx->trt_ctx = engine_->createExecutionContext();
+        if (!ctx->trt_ctx) {
+            fprintf(stderr, "[TRT] Failed to create execution context %d\n", i);
             return false;
         }
-        output_device_ptrs_.push_back(dev_ptr);
 
-        float* host_ptr = static_cast<float*>(malloc(output_sizes_[i]));
-        if (!host_ptr) return false;
-        output_hosts_.push_back(host_ptr);
+        if (!ctx->allocate(config_, engine_, input_index_,
+                           output_indices_, output_sizes_, input_size_)) {
+            fprintf(stderr, "[TRT] Failed to allocate buffers for context %d\n", i);
+            ctx->free();
+            return false;
+        }
+
+        free_contexts_.push_back(ctx.get());
+        contexts_.push_back(std::move(ctx));
     }
 
     return true;
 }
 
-void TRTEngine::free_buffers() {
-    if (input_device_) { cudaFree(input_device_); input_device_ = nullptr; }
-    if (input_host_) { free(input_host_); input_host_ = nullptr; }
+void TRTEngine::unload() {
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex_);
+        free_contexts_.clear();
+    }
+    pool_cv_.notify_all();
 
-    for (auto* p : output_device_ptrs_) { if (p) cudaFree(p); }
-    output_device_ptrs_.clear();
+    for (auto& ctx : contexts_) {
+        ctx->free();
+    }
+    contexts_.clear();
 
-    for (auto* p : output_hosts_) { if (p) free(p); }
-    output_hosts_.clear();
+    if (engine_) { engine_->destroy(); engine_ = nullptr; }
+    if (runtime_) { runtime_->destroy(); runtime_ = nullptr; }
+}
+
+ExecutionContext* TRTEngine::acquire_context(int timeout_ms) {
+    std::unique_lock<std::mutex> lock(pool_mutex_);
+
+    if (free_contexts_.empty()) {
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+        if (!pool_cv_.wait_until(lock, deadline, [this] { return !free_contexts_.empty(); })) {
+            fprintf(stderr, "[TRT] WARNING: context pool exhausted, timeout after %d ms\n", timeout_ms);
+            return nullptr;
+        }
+    }
+
+    ExecutionContext* ctx = free_contexts_.front();
+    free_contexts_.pop_front();
+    return ctx;
+}
+
+void TRTEngine::release_context(ExecutionContext* ctx) {
+    if (!ctx) return;
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex_);
+        free_contexts_.push_back(ctx);
+    }
+    pool_cv_.notify_one();
 }
 
 std::vector<Detection> TRTEngine::infer(const unsigned char* input_data,
@@ -121,34 +201,47 @@ std::vector<Detection> TRTEngine::infer(const unsigned char* input_data,
                                         cudaStream_t stream) {
     if (!is_loaded() || input_index_ < 0) return {};
 
-    size_t input_vol = static_cast<size_t>(config_.input_w) * config_.input_h * 3;
-    size_t input_bytes = input_vol * sizeof(float);
+    ExecutionContext* ctx = acquire_context(200);
+    if (!ctx) {
+        fprintf(stderr, "[TRT] FATAL: No available execution context — dropping frame\n");
+        return {};
+    }
+
+    auto result = infer_with_context(ctx, input_data, width, height, channels, stream);
+    release_context(ctx);
+    return result;
+}
+
+std::vector<Detection> TRTEngine::infer_with_context(ExecutionContext* ctx,
+                                                     const unsigned char* input_data,
+                                                     int width, int height, int channels,
+                                                     cudaStream_t external_stream) {
+    cudaStream_t stream = external_stream ? external_stream : ctx->own_stream;
 
     cuda_preprocess_resize_normalize(
         input_data, width, height, channels,
-        static_cast<float*>(input_device_),
+        static_cast<float*>(ctx->input_device),
         config_.input_w, config_.input_h,
-        config_.score_threshold > 0 ? nullptr : nullptr,
-        config_.score_threshold > 0 ? nullptr : nullptr,
+        nullptr, nullptr,
         true, true, stream);
 
     std::vector<void*> bindings(engine_->getNbBindings(), nullptr);
-    bindings[input_index_] = input_device_;
+    bindings[input_index_] = ctx->input_device;
     for (size_t i = 0; i < output_indices_.size(); ++i) {
-        bindings[output_indices_[i]] = output_device_ptrs_[i];
+        bindings[output_indices_[i]] = ctx->output_device_ptrs[i];
     }
 
-    context_->enqueueV2(bindings.data(), stream, nullptr);
+    ctx->trt_ctx->enqueueV2(bindings.data(), stream, nullptr);
 
     int out_count = 0;
     if (!output_indices_.empty()) {
-        cudaMemcpyAsync(output_hosts_[0], output_device_ptrs_[0],
+        cudaMemcpyAsync(ctx->output_hosts[0], ctx->output_device_ptrs[0],
                         output_sizes_[0], cudaMemcpyDeviceToHost, stream);
         cudaStreamSynchronize(stream);
         out_count = static_cast<int>(output_sizes_[0] / sizeof(float)) / 6;
     }
 
-    return postprocess(output_hosts_[0], 0, out_count);
+    return postprocess(ctx->output_hosts[0], 0, out_count);
 }
 
 std::vector<std::vector<Detection>> TRTEngine::infer_batch(

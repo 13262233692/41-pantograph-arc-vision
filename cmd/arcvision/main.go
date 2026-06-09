@@ -12,9 +12,12 @@ extern int arcvision_engine_init(const char* visible_engine_path,
                                  float visible_thresh,
                                  float uv_thresh,
                                  float nms_thresh,
-                                 const char* zmq_endpoint);
+                                 const char* zmq_endpoint,
+                                 int num_streams);
 
-extern void arcvision_engine_set_queues(void* visible_queue, void* uv_queue);
+extern void arcvision_engine_set_stream_queues(int stream_index,
+                                                void* visible_queue,
+                                                void* uv_queue);
 
 extern int arcvision_engine_process_frame(const unsigned char* visible_gpu,
                                           const unsigned char* uv_gpu,
@@ -29,9 +32,7 @@ extern void arcvision_engine_shutdown();
 import "C"
 import (
 	"context"
-	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -51,16 +52,16 @@ type StreamConfig struct {
 }
 
 type AppConfig struct {
-	GPUDeviceID      int             `yaml:"gpu_device_id"`
-	VisibleEngine    string          `yaml:"visible_engine_path"`
-	UVEngine         string          `yaml:"uv_engine_path"`
-	VisibleThreshold float32         `yaml:"visible_score_threshold"`
-	UVThreshold      float32         `yaml:"uv_score_threshold"`
-	NMSThreshold     float32         `yaml:"nms_threshold"`
-	SyncToleranceMs  float64         `yaml:"sync_tolerance_ms"`
-	ZmqEndpoint      string          `yaml:"zmq_endpoint"`
-	Streams          []StreamConfig  `yaml:"streams"`
-	ShmKeyBase       uintptr         `yaml:"shm_key_base"`
+	GPUDeviceID      int            `yaml:"gpu_device_id"`
+	VisibleEngine    string         `yaml:"visible_engine_path"`
+	UVEngine         string         `yaml:"uv_engine_path"`
+	VisibleThreshold float32        `yaml:"visible_score_threshold"`
+	UVThreshold      float32        `yaml:"uv_score_threshold"`
+	NMSThreshold     float32        `yaml:"nms_threshold"`
+	SyncToleranceMs  float64        `yaml:"sync_tolerance_ms"`
+	ZmqEndpoint      string         `yaml:"zmq_endpoint"`
+	Streams          []StreamConfig `yaml:"streams"`
+	ShmKeyBase       uintptr        `yaml:"shm_key_base"`
 }
 
 func loadConfig(path string) *AppConfig {
@@ -87,20 +88,31 @@ func loadConfig(path string) *AppConfig {
 
 func main() {
 	cfg := loadConfig("configs/config.yaml")
+	numStreams := len(cfg.Streams)
 
 	log.Println("[ArcVision] Starting pantograph arc flash detection system")
 	log.Printf("[ArcVision] GPU Device: %d", cfg.GPUDeviceID)
 	log.Printf("[ArcVision] Visible engine: %s", cfg.VisibleEngine)
 	log.Printf("[ArcVision] UV engine: %s", cfg.UVEngine)
 	log.Printf("[ArcVision] ZMQ endpoint: %s", cfg.ZmqEndpoint)
+	log.Printf("[ArcVision] Number of streams: %d", numStreams)
 
-	visQueue := shm.CreateFrameQueue(cfg.ShmKeyBase)
-	uvQueue := shm.CreateFrameQueue(cfg.ShmKeyBase + 1)
-	if visQueue == nil || uvQueue == nil {
-		log.Fatal("[ArcVision] Failed to create shared memory queues")
+	streamQueues := make(map[int]*shm.FrameQueue, numStreams)
+	for _, sc := range cfg.Streams {
+		visKey := cfg.ShmKeyBase + uintptr(sc.StreamIndex*2)
+		uvKey := cfg.ShmKeyBase + uintptr(sc.StreamIndex*2+1)
+
+		visQ := shm.CreateFrameQueue(visKey)
+		uvQ := shm.CreateFrameQueue(uvKey)
+		if visQ == nil || uvQ == nil {
+			log.Fatalf("[ArcVision] Failed to create shared memory queues for stream %d", sc.StreamIndex)
+		}
+		defer visQ.Destroy()
+		defer uvQ.Destroy()
+
+		streamQueues[sc.StreamIndex] = visQ
+		_ = uvQ
 	}
-	defer visQueue.Destroy()
-	defer uvQueue.Destroy()
 
 	cVisibleEngine := C.CString(cfg.VisibleEngine)
 	cUVEngine := C.CString(cfg.UVEngine)
@@ -117,16 +129,26 @@ func main() {
 		C.float(cfg.UVThreshold),
 		C.float(cfg.NMSThreshold),
 		cZmqEndpoint,
+		C.int(numStreams),
 	)
 	if rc != 0 {
 		log.Fatalf("[ArcVision] Engine init failed: %d", rc)
 	}
 	defer C.arcvision_engine_shutdown()
 
-	C.arcvision_engine_set_queues(
-		visQueue.NativePointer(),
-		uvQueue.NativePointer(),
-	)
+	for _, sc := range cfg.Streams {
+		visKey := cfg.ShmKeyBase + uintptr(sc.StreamIndex*2)
+		uvKey := cfg.ShmKeyBase + uintptr(sc.StreamIndex*2+1)
+
+		visQ := shm.CreateFrameQueue(visKey)
+		uvQ := shm.CreateFrameQueue(uvKey)
+
+		C.arcvision_engine_set_stream_queues(
+			C.int(sc.StreamIndex),
+			visQ.NativePointer(),
+			uvQ.NativePointer(),
+		)
+	}
 
 	syncToleranceNs := int64(cfg.SyncToleranceMs * float64(time.Millisecond))
 	multiSync := sync.NewMultiStreamSync(syncToleranceNs, 30)
@@ -146,6 +168,16 @@ func main() {
 	}
 
 	multiSync.SetSyncedCallback(func(streamIdx int, vis, uv *sync.TimestampedFrame) {
+		visQ := streamQueues[streamIdx]
+		if visQ == nil {
+			return
+		}
+		uvKey := cfg.ShmKeyBase + uintptr(streamIdx*2+1)
+		uvQ := shm.CreateFrameQueue(uvKey)
+		if uvQ == nil {
+			return
+		}
+
 		visHeader := &shm.FrameHeader{
 			PTSNs:       vis.PTSNs,
 			Width:       int32(vis.Width),
@@ -154,7 +186,7 @@ func main() {
 			Type:        shm.FrameTypeVisibleLight,
 			StreamIndex: int32(streamIdx),
 		}
-		visQueue.Push(visHeader, vis.Data)
+		visQ.Push(visHeader, vis.Data)
 
 		uvHeader := &shm.FrameHeader{
 			PTSNs:       uv.PTSNs,
@@ -164,7 +196,7 @@ func main() {
 			Type:        shm.FrameTypeUltraviolet,
 			StreamIndex: int32(streamIdx),
 		}
-		uvQueue.Push(uvHeader, uv.Data)
+		uvQ.Push(uvHeader, uv.Data)
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -310,7 +342,7 @@ func resultAggregator(ctx context.Context, receiver *result.ResultReceiver) {
 			}
 			for _, r := range results {
 				if r.Confidence > 0.7 {
-					log.Printf("[ALERT] Arc flash detected! Stream=%d PTS=%d "
+					log.Printf("[ALERT] Arc flash detected! Stream=%d PTS=%d "+
 						"Box=[%.1f,%.1f,%.1f,%.1f] Conf=%.3f Intensity=%.4f",
 						r.StreamIndex, r.PTSNs,
 						r.X1, r.Y1, r.X2, r.Y2,
@@ -320,5 +352,3 @@ func resultAggregator(ctx context.Context, receiver *result.ResultReceiver) {
 		}
 	}
 }
-
-func _ = math.Pi
