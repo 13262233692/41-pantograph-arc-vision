@@ -157,6 +157,7 @@ func main() {
 		Endpoint:   cfg.ZmqEndpoint,
 		BufferSize: 512,
 		Subscribe:  "",
+		AlarmDir:   "alarms",
 	})
 	if err != nil {
 		log.Fatalf("[ArcVision] Failed to create result receiver: %v", err)
@@ -341,12 +342,23 @@ func resultAggregator(ctx context.Context, receiver *result.ResultReceiver) {
 				return
 			}
 			for _, r := range results {
-				if r.Confidence > 0.7 {
-					log.Printf("[ALERT] Arc flash detected! Stream=%d PTS=%d "+
-						"Box=[%.1f,%.1f,%.1f,%.1f] Conf=%.3f Intensity=%.4f",
-						r.StreamIndex, r.PTSNs,
-						r.X1, r.Y1, r.X2, r.Y2,
-						r.Confidence, r.Intensity)
+				if r.SeverityLevel >= result.Level2StableArc {
+					durationMs := r.TrackDurationNs / 1e6
+					log.Printf("[ALERT] %s! Stream=%d Track=%d PTS=%d "+
+						"Box=[%.1f,%.1f,%.1f,%.1f] Conf=%.3f "+
+						"Energy=[instant=%.2f smoothed=%.2f cumulative=%.2f] "+
+						"Frames=%d Duration=%dms",
+						r.SeverityLevel, r.StreamIndex, r.TrackID, r.PTSNs,
+						r.X1, r.Y1, r.X2, r.Y2, r.Confidence,
+						r.InstantEnergy, r.SmoothedEnergy, r.CumulativeEnergy,
+						r.TrackFrameCount, durationMs)
+
+					if r.SeverityLevel >= result.Level4SustainedBurn {
+						log.Printf("[CRITICAL] ⚠ 致命烧蚀风险! Stream=%d Track=%d "+
+							"累计能量=%.2f 持续时间=%dms 立即断电!",
+							r.StreamIndex, r.TrackID,
+							r.CumulativeEnergy, durationMs)
+					}
 				}
 			}
 		}

@@ -13,7 +13,16 @@ struct ArcResultMsg {
     int64_t pts_ns;
     int32_t stream_index;
     double intensity;
+    double instant_energy;
+    double smoothed_energy;
+    double cumulative_energy;
+    int32_t severity_level;
+    int32_t track_id;
+    int32_t track_frame_count;
+    int64_t track_duration_ns;
 };
+
+static_assert(sizeof(ArcResultMsg) == 88, "ArcResultMsg must be 88 bytes for wire compatibility");
 
 class ZmqPublisher {
 public:

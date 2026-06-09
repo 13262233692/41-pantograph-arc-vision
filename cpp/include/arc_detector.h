@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include "trt_engine.h"
 #include "cuda_preprocess.h"
+#include "arc_severity.h"
 
 struct ArcFlashEvent {
     float x1, y1, x2, y2;
@@ -16,6 +17,13 @@ struct ArcFlashEvent {
     int64_t pts_ns;
     int32_t stream_index;
     double intensity;
+    double instant_energy;
+    double smoothed_energy;
+    double cumulative_energy;
+    ArcSeverityLevel severity;
+    int32_t track_id;
+    int32_t track_frame_count;
+    int64_t track_duration_ns;
 };
 
 struct PantographROI {
@@ -36,11 +44,13 @@ struct ArcDetectorConfig {
     int model_input_h = 640;
     int model_input_w = 640;
     int context_pool_size = 4;
+    ArcSeverityThresholds severity_thresholds;
 };
 
 struct StreamInferContext {
     std::unique_ptr<TRTEngine> visible_engine;
     std::unique_ptr<TRTEngine> uv_engine;
+    std::unique_ptr<ArcLifecycleTracker> lifecycle_tracker;
     int stream_index;
     bool initialized = false;
 };

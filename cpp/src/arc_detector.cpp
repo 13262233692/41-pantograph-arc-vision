@@ -63,11 +63,14 @@ bool ArcDetector::init_stream(int stream_index) {
         return false;
     }
 
+    ctx->lifecycle_tracker = std::make_unique<ArcLifecycleTracker>(
+        config_.severity_thresholds, 0.3, 100000000LL, 64);
+
     ctx->initialized = true;
     stream_contexts_[stream_index] = std::move(ctx);
 
     fprintf(stderr, "[ArcDetector] stream=%d: Created exclusive inference context "
-            "(vis_ctx=%d, uv_ctx=%d)\n",
+            "(vis_ctx=%d, uv_ctx=%d, lifecycle_tracker=ON)\n",
             stream_index,
             ctx->visible_engine->pool_size(),
             ctx->uv_engine->pool_size());
@@ -123,14 +126,73 @@ std::vector<ArcFlashEvent> ArcDetector::detect(
     auto rois = extract_pantograph_rois(sctx->visible_engine.get(),
                                          visible_gpu, width, height, stream);
     if (rois.empty()) {
+        sctx->lifecycle_tracker->expire_old_tracks(pts_ns);
         return {};
     }
 
-    auto events = detect_arc_in_rois(sctx->uv_engine.get(),
-                                     uv_gpu, visible_gpu, width, height,
-                                     rois, pts_ns, stream_index, stream);
+    auto raw_events = detect_arc_in_rois(sctx->uv_engine.get(),
+                                          uv_gpu, visible_gpu, width, height,
+                                          rois, pts_ns, stream_index, stream);
 
-    return nms(events, config_.nms_thresh);
+    auto filtered = nms(raw_events, config_.nms_thresh);
+
+    std::vector<std::pair<double,double,double,double>> det_boxes;
+    std::vector<double> det_energies;
+
+    for (auto& evt : filtered) {
+        double energy = EnergyEstimator::compute_instant_energy_gpu(
+            evt.x1, evt.y1, evt.x2, evt.y2,
+            uv_gpu, width, height, stream);
+        evt.instant_energy = energy;
+        det_boxes.emplace_back(evt.x1, evt.y1, evt.x2, evt.y2);
+        det_energies.push_back(energy);
+    }
+
+    auto track_updates = sctx->lifecycle_tracker->update(pts_ns, det_boxes, det_energies);
+    sctx->lifecycle_tracker->expire_old_tracks(pts_ns);
+
+    std::unordered_map<int32_t, ArcLifecycleTracker::TrackUpdate> track_map;
+    for (const auto& upd : track_updates) {
+        track_map[upd.track_id] = upd;
+    }
+
+    for (auto& evt : filtered) {
+        for (const auto& upd : track_updates) {
+            double iou_x1 = std::max(static_cast<double>(evt.x1), upd.box_x1);
+            double iou_y1 = std::max(static_cast<double>(evt.y1), upd.box_y1);
+            double iou_x2 = std::min(static_cast<double>(evt.x2), upd.box_x2);
+            double iou_y2 = std::min(static_cast<double>(evt.y2), upd.box_y2);
+
+            double iw = std::max(0.0, iou_x2 - iou_x1);
+            double ih = std::max(0.0, iou_y2 - iou_y1);
+            double inter = iw * ih;
+            double area_e = (evt.x2 - evt.x1) * (evt.y2 - evt.y1);
+            double area_u = (upd.box_x2 - upd.box_x1) * (upd.box_y2 - upd.box_y1);
+            double union_a = area_e + area_u - inter;
+            double iou = union_a > 0 ? inter / union_a : 0.0;
+
+            if (iou > 0.5) {
+                evt.track_id = upd.track_id;
+                evt.smoothed_energy = upd.smoothed_energy;
+                evt.cumulative_energy = upd.cumulative_energy;
+                evt.severity = upd.severity;
+                evt.track_frame_count = upd.frame_count;
+                evt.track_duration_ns = upd.duration_ns;
+                break;
+            }
+        }
+
+        if (evt.track_id <= 0) {
+            evt.severity = ArcSeverityLevel::LEVEL_1_MINOR_SPARK;
+            evt.track_id = 0;
+            evt.track_frame_count = 1;
+            evt.track_duration_ns = 0;
+            evt.smoothed_energy = evt.instant_energy;
+            evt.cumulative_energy = evt.instant_energy;
+        }
+    }
+
+    return filtered;
 }
 
 std::vector<PantographROI> ArcDetector::extract_pantograph_rois(
@@ -223,6 +285,14 @@ std::vector<ArcFlashEvent> ArcDetector::detect_arc_in_rois(
             float box_h = evt.y2 - evt.y1;
             float box_area = box_w * box_h;
             evt.intensity = box_area > 0 ? det.confidence / box_area : 0.0;
+
+            evt.instant_energy = 0.0;
+            evt.smoothed_energy = 0.0;
+            evt.cumulative_energy = 0.0;
+            evt.severity = ArcSeverityLevel::LEVEL_1_MINOR_SPARK;
+            evt.track_id = 0;
+            evt.track_frame_count = 0;
+            evt.track_duration_ns = 0;
 
             all_events.push_back(evt);
         }

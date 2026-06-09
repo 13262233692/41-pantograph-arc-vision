@@ -46,6 +46,15 @@ int arcvision_engine_init(const char* visible_engine_path,
     config.nms_thresh = nms_thresh;
     config.context_pool_size = 1;
 
+    config.severity_thresholds.level2_cumulative_energy = 500.0;
+    config.severity_thresholds.level3_cumulative_energy = 5000.0;
+    config.severity_thresholds.level4_cumulative_energy = 50000.0;
+    config.severity_thresholds.level5_cumulative_energy = 500000.0;
+    config.severity_thresholds.level3_instant_energy = 1000.0;
+    config.severity_thresholds.level5_instant_energy = 10000.0;
+    config.severity_thresholds.level4_duration_ns = 3000000000LL;
+    config.severity_thresholds.level5_duration_ns = 10000000000LL;
+
     g_detector = new ArcDetector(config);
     if (!g_detector->init()) {
         fprintf(stderr, "[Engine] Failed to initialize arc detector base\n");
@@ -120,6 +129,13 @@ int arcvision_engine_process_frame(const unsigned char* visible_gpu,
             m.pts_ns = evt.pts_ns;
             m.stream_index = evt.stream_index;
             m.intensity = evt.intensity;
+            m.instant_energy = evt.instant_energy;
+            m.smoothed_energy = evt.smoothed_energy;
+            m.cumulative_energy = evt.cumulative_energy;
+            m.severity_level = static_cast<int32_t>(evt.severity);
+            m.track_id = evt.track_id;
+            m.track_frame_count = evt.track_frame_count;
+            m.track_duration_ns = evt.track_duration_ns;
             msgs.push_back(m);
         }
 

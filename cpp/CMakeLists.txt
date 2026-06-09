@@ -49,6 +49,7 @@ set(SOURCES
     src/shm_frame_queue.cpp
     src/trt_engine.cpp
     src/arc_detector.cpp
+    src/arc_severity.cpp
     src/zmq_publisher.cpp
     src/engine_main.cpp
 )
