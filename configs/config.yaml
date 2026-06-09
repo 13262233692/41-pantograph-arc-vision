@@ -1,0 +1,20 @@
+gpu_device_id: 0
+visible_engine_path: "models/pantograph_detect.trt"
+uv_engine_path: "models/arc_flash_detect.trt"
+visible_score_threshold: 0.5
+uv_score_threshold: 0.4
+nms_threshold: 0.45
+sync_tolerance_ms: 5.0
+zmq_endpoint: "ipc:///tmp/arcvision_results"
+shm_key_base: 1096302592
+
+streams:
+  - visible_rtsp: "rtsp://192.168.1.100:554/visible"
+    uv_rtsp: "rtsp://192.168.1.101:554/uv"
+    stream_index: 0
+  - visible_rtsp: "rtsp://192.168.1.102:554/visible"
+    uv_rtsp: "rtsp://192.168.1.103:554/uv"
+    stream_index: 1
+  - visible_rtsp: "rtsp://192.168.1.104:554/visible"
+    uv_rtsp: "rtsp://192.168.1.105:554/uv"
+    stream_index: 2
